@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""doc2md - Convert documents (docx first, pdf/pptx planned) to agent-friendly Markdown.
+"""doc2md - Convert documents (docx, pdf) to agent-friendly Markdown.
 
 Product layout per document:
     output/<name>/
@@ -9,6 +9,7 @@ Product layout per document:
 
 Usage:
     python doc2md.py <input.docx> [-o <output-dir>]
+    python doc2md.py <input.pdf>  [-o <output-dir>]
 """
 
 import argparse
@@ -166,9 +167,227 @@ def convert_docx(docx_path: Path, out_root: Path) -> dict:
     return meta
 
 
+def convert_docx(docx_path: Path, out_root: Path) -> dict:
+    name = docx_path.stem
+    out_dir = out_root / name
+    images_dir = out_dir / "images"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    image_map = extract_images(docx_path, images_dir)
+
+    doc = docx.Document(str(docx_path))
+    n_tables = len(doc.tables)
+
+    table_md = [table_to_markdown(t) for t in doc.tables]
+
+    result = mammoth.convert_to_html(str(docx_path))
+    html = result.value
+    mammoth_messages = [m.message for m in result.messages]
+
+    body = shape_mammoth_html(html)
+
+    # re-insert tables at the first slots in order of appearance
+    for t in table_md:
+        body = body.replace("\x00TABLE_SLOT\x00", t, 1)
+    leftover_slots = body.count("\x00TABLE_SLOT\x00")
+    body = body.replace("\x00TABLE_SLOT\x00", "")  # extra slots (nested/unsupported)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+
+    md_path = out_dir / "article.md"
+    md_path.write_text(body + "\n", encoding="utf-8")
+
+    meta = {
+        "source": str(docx_path),
+        "format": "docx",
+        "paragraphs": len(doc.paragraphs),
+        "tables": n_tables,
+        "tables_emitted": n_tables - leftover_slots,
+        "images": len(image_map),
+        "styles": sorted({p.style.name for p in doc.paragraphs if p.style is not None}),
+        "mammoth_messages": mammoth_messages[:20],
+        "degraded": [],
+    }
+    if leftover_slots:
+        meta["degraded"].append(
+            f"{leftover_slots} table slot(s) not re-emitted (nested tables or "
+            "tables in unusual positions) - inspect word/document.xml directly")
+    (out_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# pdf conversion via PyMuPDF (fitz)
+# ---------------------------------------------------------------------------
+
+def pdf_escape(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def pdf_detect_heading_sizes(page_count: int, sizes: dict) -> dict:
+    """Map body font size -> heading level. Returns {size: level} for the
+    largest distinct sizes (level 1 for biggest, max 3 levels)."""
+    if not sizes:
+        return {}
+    ranked = sorted(sizes, key=lambda s: -s)
+    # skip sizes that look like body text duplicates (within 0.5pt)
+    distinct = []
+    for s in ranked:
+        if not distinct or (distinct[-1] - s) > 0.5:
+            distinct.append(s)
+    levels = {}
+    for i, s in enumerate(distinct[:3]):
+        levels[s] = i + 1
+    return levels
+
+
+def get_fitz():
+    """Lazy import of pymupdf. Returns the module or None with an error printed."""
+    try:
+        import fitz  # pymupdf
+        return fitz
+    except ImportError as e:
+        print(f"missing dependency: {e.name} (pip install pymupdf)", file=sys.stderr)
+        return None
+
+
+def pdf_extract_images(fitz_doc, images_dir: Path) -> int:
+    """Extract embedded raster images. Returns count. Skips tiny icons (<10KB)."""
+    fitz = get_fitz()
+    if fitz is None:
+        return 0
+    images_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    seen_xrefs = set()
+    for pno in range(len(fitz_doc)):
+        for info in fitz_doc[pno].get_images(full=True):
+            xref = info[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            try:
+                pix = fitz.Pixmap(fitz_doc, xref)
+                if pix.width < 50 or pix.height < 50 or len(pix.samples) < 10_000:
+                    continue
+                if pix.colorspace and pix.colorspace.n > 3:  # CMYK etc -> RGB
+                    pix = fitz.Pixmap(fitz.csRGB, pix)
+                ext = "png" if pix.alpha or (pix.colorspace and pix.colorspace.n != 3) else "jpeg"
+                target = images_dir / f"p{pno + 1}_img{count + 1}.{ext}"
+                target.write_bytes(pix.tobytes(ext if ext == "png" else "jpg"))
+                count += 1
+            except Exception as e:  # unreadable image: note and move on
+                print(f"warn: image xref {xref} on page {pno + 1}: {e}", file=sys.stderr)
+    return count
+
+
+def convert_pdf(pdf_path: Path, out_root: Path) -> dict:
+    name = pdf_path.stem
+    out_dir = out_root / name
+    images_dir = out_dir / "images"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fitz = get_fitz()
+    if fitz is None:
+        raise SystemExit(2)
+    doc = fitz.open(str(pdf_path))
+    n_pages = len(doc)
+
+    # first pass: font size histogram for heading detection
+    size_hist = {}
+    for page in doc:
+        for block in page.get_text("dict")["blocks"]:
+            if block.get("type") != 0:
+                continue
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    if span["text"].strip():
+                        size = round(span["size"], 1)
+                        size_hist[size] = size_hist.get(size, 0) + 1
+    # body size = most frequent; headings = sizes clearly above body
+    body_size = max(size_hist, key=lambda s: size_hist[s]) if size_hist else 0
+    heading_sizes = {s: lvl for s, lvl in pdf_detect_heading_sizes(n_pages, size_hist).items()
+                     if s > body_size + 1.0}
+
+    n_images = pdf_extract_images(doc, images_dir)
+
+    # second pass: emit markdown per page
+    parts = []
+    total_chars = 0
+    img_seq = 0
+    for pno, page in enumerate(doc, 1):
+        if pno > 1:
+            parts.append("\n---\n")  # page separator
+        page_md = []
+        last_img_rect = None  # merge vertically-adjacent image blocks (decorative splits)
+        for block in page.get_text("dict")["blocks"]:
+            if block["type"] == 1:  # image block: save as positional PNG
+                rect = fitz.Rect(block["bbox"])
+                if rect.width < 20 or rect.height < 20:
+                    continue  # tiny decoration, skip entirely
+                if (last_img_rect is not None and rect.y0 - last_img_rect.y1 < 5
+                        and abs(rect.x0 - last_img_rect.x0) < 5):
+                    # continuation of previous image strip: don't re-reference
+                    last_img_rect = rect
+                    continue
+                last_img_rect = rect
+                img_seq += 1
+                target = images_dir / f"p{pno}_img{img_seq}.png"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                pix = page.get_pixmap(clip=rect, dpi=150)
+                target.write_bytes(pix.tobytes("png"))
+                page_md.append(f"![](images/{target.name})")
+                continue
+            text = ""
+            sizes_seen = []
+            for line in block["lines"]:
+                line_text = "".join(span["text"] for span in line["spans"]).strip()
+                if line_text:
+                    text += line_text + " "
+                    sizes_seen.extend(round(sp["size"], 1) for sp in line["spans"]
+                                      if sp["text"].strip())
+            text = text.strip()
+            if not text:
+                continue
+            total_chars += len(text)
+            top = max(sizes_seen) if sizes_seen else body_size
+            if top in heading_sizes:
+                page_md.append("#" * heading_sizes[top] + " " + text)
+            else:
+                page_md.append(text)
+        if page_md:
+            parts.append("\n\n".join(page_md))
+        # vector/table regions can't be split reliably; PyMuPDF text blocks
+        # already flatten table rows into text lines, which is acceptable
+
+    doc.close()
+
+    body = "\n\n".join(parts)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    (out_dir / "article.md").write_text(body + "\n", encoding="utf-8")
+
+    meta = {
+        "source": str(pdf_path),
+        "format": "pdf",
+        "pages": n_pages,
+        "images": n_images,
+        "image_blocks_rendered": img_seq,
+        "body_font_size": body_size,
+        "heading_sizes": heading_sizes,
+        "text_chars": total_chars,
+        "degraded": [],
+    }
+    if total_chars < 100 and n_pages > 0:
+        meta["degraded"].append(
+            "near-zero text extracted - likely a scanned PDF; run OCR "
+            "(tesseract -l chi_sim) on page images instead")
+    (out_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Convert docx to agent-friendly markdown")
-    ap.add_argument("input", help="path to .docx file")
+    ap = argparse.ArgumentParser(description="Convert documents (docx/pdf) to agent-friendly markdown")
+    ap.add_argument("input", help="path to .docx or .pdf file")
     ap.add_argument("-o", "--output", help="output root dir (default: ./output next to input)")
     args = ap.parse_args()
 
@@ -176,16 +395,23 @@ def main() -> int:
     if not src.is_file():
         print(f"input not found: {src}", file=sys.stderr)
         return 1
-    if src.suffix.lower() != ".docx":
-        print(f"unsupported format for now (v1 is docx-only): {src.suffix}", file=sys.stderr)
+
+    fmt = src.suffix.lower()
+    if fmt not in (".docx", ".pdf"):
+        print(f"unsupported format (docx and pdf supported): {fmt}", file=sys.stderr)
         return 1
 
     out_root = Path(args.output).expanduser().resolve() if args.output else src.parent / "output"
-    meta = convert_docx(src, out_root)
+    if fmt == ".pdf":
+        meta = convert_pdf(src, out_root)
+        print(f"meta: pages={meta['pages']} images={meta['images']} "
+              f"chars={meta['text_chars']} degraded={len(meta['degraded'])}")
+    else:
+        meta = convert_docx(src, out_root)
+        print(f"meta: paragraphs={meta['paragraphs']} tables={meta['tables_emitted']}/{meta['tables']} "
+              f"images={meta['images']} degraded={len(meta['degraded'])}")
     out_dir = out_root / src.stem
     print(f"converted: {out_dir / 'article.md'}")
-    print(f"meta: paragraphs={meta['paragraphs']} tables={meta['tables_emitted']}/{meta['tables']} "
-          f"images={meta['images']} degraded={len(meta['degraded'])}")
     return 0
 
 

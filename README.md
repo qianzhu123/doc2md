@@ -12,13 +12,13 @@ markdown instead of guessing at binary formats.
 | Format | Status | Engine |
 |---|---|---|
 | `.docx` | v1 (current) | mammoth (semantic) + python-docx (tables) + raw zip (media) |
-| `.pdf` | planned | text layer extraction; OCR fallback for scans (tesseract) |
+| `.pdf` | v1.1 (current) | PyMuPDF: text layer + font-size heading detection + image block rendering; scanned-PDF detection with OCR guidance |
 | `.pptx` | planned | per-slide text dump + media extraction |
 
 ## Install
 
 ```bash
-pip install python-docx mammoth
+pip install python-docx mammoth pymupdf
 ```
 
 Uses only libraries already present in most Anaconda distributions.
@@ -54,8 +54,12 @@ inspect the raw XML for those parts instead of silently losing content.
 - **Tables are first-class.** Cell text is read cell-by-cell via python-docx
   and emitted as GitHub-flavored pipe tables, which survive better than
   HTML-to-markdown conversion of table markup.
-- **Images stay on disk.** They are extracted from `word/media/` and
-  referenced with relative paths; nothing is inlined as base64.
+- **Images stay on disk.** docx images are extracted from `word/media/`;
+  pdf image blocks are rendered as page-position PNGs (vertically-adjacent
+  decorative fragments merged). Nothing is inlined as base64.
+- **Scanned PDFs are detected, not silently mangled.** If a pdf yields
+  near-zero text, `meta.json` flags it as `degraded` with a pointer to OCR
+  (tesseract) instead of producing an empty markdown.
 
 ## License
 
