@@ -3,6 +3,7 @@
 Convert common document formats (docx, pdf, pptx) into agent-friendly Markdown,
 with images extracted to disk and a metadata sidecar for quick triage.
 
+
 Built for AI agent workflows: the output is a predictable product directory
 (`article.md` + `images/` + `meta.json`) so an agent can read the converted
 markdown instead of guessing at binary formats.
@@ -13,12 +14,12 @@ markdown instead of guessing at binary formats.
 |---|---|---|
 | `.docx` | v1 (current) | mammoth (semantic) + python-docx (tables) + raw zip (media) |
 | `.pdf` | v1.1 (current) | PyMuPDF: text layer + font-size heading detection + image block rendering; scanned-PDF detection with OCR guidance |
-| `.pptx` | planned | per-slide text dump + media extraction |
+| `.pptx` | v1.2 (current) | python-pptx: per-slide dump with title headings, bullet levels, tables, pictures, speaker notes |
 
 ## Install
 
 ```bash
-pip install python-docx mammoth pymupdf
+pip install python-docx mammoth pymupdf python-pptx
 ```
 
 Uses only libraries already present in most Anaconda distributions.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""doc2md - Convert documents (docx, pdf) to agent-friendly Markdown.
+"""doc2md - Convert documents (docx, pdf, pptx) to agent-friendly Markdown.
 
 Product layout per document:
     output/<name>/
@@ -10,6 +10,7 @@ Product layout per document:
 Usage:
     python doc2md.py <input.docx> [-o <output-dir>]
     python doc2md.py <input.pdf>  [-o <output-dir>]
+    python doc2md.py <input.pptx> [-o <output-dir>]
 """
 
 import argparse
@@ -385,9 +386,120 @@ def convert_pdf(pdf_path: Path, out_root: Path) -> dict:
     return meta
 
 
+# ---------------------------------------------------------------------------
+# pptx conversion via python-pptx
+# ---------------------------------------------------------------------------
+
+def pptx_shape_text(shape) -> str:
+    """Extract paragraph text from a shape, preserving list levels as bullets."""
+    if not shape.has_text_frame:
+        return ""
+    lines = []
+    for para in shape.text_frame.paragraphs:
+        text = "".join(run.text for run in para.runs).strip()
+        if not text:
+            continue
+        indent = "  " * min(para.level, 3) if para.level else ""
+        lines.append(f"{indent}- {text}")
+    return "\n".join(lines)
+
+
+def convert_pptx(pptx_path: Path, out_root: Path) -> dict:
+    name = pptx_path.stem
+    out_dir = out_root / name
+    images_dir = out_dir / "images"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from pptx import Presentation
+    except ImportError as e:
+        print(f"missing dependency: {e.name} (pip install python-pptx)", file=sys.stderr)
+        raise SystemExit(2)
+
+    prs = Presentation(str(pptx_path))
+    parts = []
+    n_tables = 0
+    n_images = 0
+    n_notes = 0
+    degraded = []
+
+    for idx, slide in enumerate(prs.slides, 1):
+        slide_md = [f"## Slide {idx}"]
+        # title placeholder first, as the slide's real heading
+        title = slide.shapes.title
+        if title is not None and title.text.strip():
+            slide_md.append(f"# {title.text.strip()}")
+        for shape in slide.shapes:
+            if shape == title:
+                continue
+            # pictures
+            if shape.shape_type == 13:  # MSO_SHAPE_TYPE.PICTURE
+                try:
+                    image = shape.image
+                    n_images += 1
+                    target = images_dir / f"slide{idx}_img{n_images}.{image.ext}"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(image.blob)
+                    slide_md.append(f"![](images/{target.name})")
+                except Exception as e:  # grouped/linked shapes without blob
+                    degraded.append(f"slide {idx}: unrecoverable picture ({e})")
+                continue
+            # tables
+            if shape.has_table:
+                n_tables += 1
+                tbl = shape.table
+                rows = []
+                for row in tbl.rows:
+                    rows.append([pdf_escape(c.text.strip()) for c in row.cells])
+                if rows:
+                    width = max(len(r) for r in rows)
+                    for r in rows:
+                        r.extend([""] * (width - len(r)))
+                    md = ["| " + " | ".join(rows[0]) + " |",
+                          "| " + " | ".join(["---"] * width) + " |"]
+                    for r in rows[1:]:
+                        md.append("| " + " | ".join(r) + " |")
+                    slide_md.append("\n".join(md))
+                continue
+            # grouped shapes: flatten one level
+            if shape.shape_type == 6:  # MSO_SHAPE_TYPE.GROUP
+                for sub in shape.shapes:
+                    t = pptx_shape_text(sub)
+                    if t:
+                        slide_md.append(t)
+                continue
+            text = pptx_shape_text(shape)
+            if text:
+                slide_md.append(text)
+        # speaker notes
+        if slide.has_notes_slide:
+            notes = slide.notes_slide.notes_text_frame.text.strip()
+            if notes:
+                n_notes += 1
+                slide_md.append(f"> notes: {notes}")
+        parts.append("\n\n".join(slide_md))
+
+    body = "\n\n".join(parts)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    (out_dir / "article.md").write_text(body + "\n", encoding="utf-8")
+
+    meta = {
+        "source": str(pptx_path),
+        "format": "pptx",
+        "slides": len(prs.slides),
+        "tables": n_tables,
+        "images": n_images,
+        "slides_with_notes": n_notes,
+        "degraded": degraded[:20],
+    }
+    (out_dir / "meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return meta
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Convert documents (docx/pdf) to agent-friendly markdown")
-    ap.add_argument("input", help="path to .docx or .pdf file")
+    ap = argparse.ArgumentParser(description="Convert documents (docx/pdf/pptx) to agent-friendly markdown")
+    ap.add_argument("input", help="path to .docx, .pdf or .pptx file")
     ap.add_argument("-o", "--output", help="output root dir (default: ./output next to input)")
     args = ap.parse_args()
 
@@ -397,8 +509,8 @@ def main() -> int:
         return 1
 
     fmt = src.suffix.lower()
-    if fmt not in (".docx", ".pdf"):
-        print(f"unsupported format (docx and pdf supported): {fmt}", file=sys.stderr)
+    if fmt not in (".docx", ".pdf", ".pptx"):
+        print(f"unsupported format (docx, pdf, pptx supported): {fmt}", file=sys.stderr)
         return 1
 
     out_root = Path(args.output).expanduser().resolve() if args.output else src.parent / "output"
@@ -406,6 +518,10 @@ def main() -> int:
         meta = convert_pdf(src, out_root)
         print(f"meta: pages={meta['pages']} images={meta['images']} "
               f"chars={meta['text_chars']} degraded={len(meta['degraded'])}")
+    elif fmt == ".pptx":
+        meta = convert_pptx(src, out_root)
+        print(f"meta: slides={meta['slides']} tables={meta['tables']} "
+              f"images={meta['images']} degraded={len(meta['degraded'])}")
     else:
         meta = convert_docx(src, out_root)
         print(f"meta: paragraphs={meta['paragraphs']} tables={meta['tables_emitted']}/{meta['tables']} "
